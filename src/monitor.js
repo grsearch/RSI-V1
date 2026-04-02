@@ -212,19 +212,23 @@ class TokenMonitor {
           state.position.peakPriceUsd = price;
         }
 
-        // ── RSI 评估 ──────────────────────────────────────────
-        state.candles = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
+        // ── RSI 评估（已收盘K线算基线 + 实时价格做增量，穿越即触发）──
+        const { closed, current: currentCandle } = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
+        // 合并 closed + current 用于 dashboard 显示
+        state.candles = currentCandle ? [...closed, currentCandle] : [...closed];
 
-        if (state.candles.length >= 2) {
-          const result = evaluateSignal(state.candles, state);
+        if (closed.length >= 2) {
+          // 传入已收盘K线 + 实时价格，evaluateSignal 内部做增量RSI
+          const result = evaluateSignal(closed, price, state);
           state.rsi    = result.rsi;
 
           // 调试日志
           if (!isNaN(result.rsi)) {
             logger.info(
               `[RSI] ${state.symbol}` +
-              ` | candles=${state.candles.length}` +
-              ` | RSI=${result.rsi.toFixed(2)}` +
+              ` | closed=${closed.length}` +
+              ` | RSI_rt=${result.rsi.toFixed(2)}` +
+              ` | price=${price}` +
               ` | inPos=${state.inPosition}` +
               ` | trades=${state.tradeCount}` +
               ` | signal=${result.signal || 'HOLD'}` +
