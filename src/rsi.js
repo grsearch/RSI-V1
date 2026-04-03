@@ -1,18 +1,14 @@
 // src/rsi.js — RSI calculation + BUY/SELL signal logic
 //
-// ⚠️ 关键设计：混合模式 — 稳定 RSI 基线 + 实时穿越检测
+// 规则（5s K线，1s轮询）：
+//   BUY : RSI(7) 上穿 30
+//   SELL: RSI 下穿 70 / RSI > 80 / TP +50%
 //
-//   问题：纯用已收盘K线 → RSI穿越信号延迟1-2根K线（5-10秒），错过最佳入场
-//         纯用未收盘K线 → 同一根K线内RSI剧烈跳动，产生虚假穿越信号
-//
-//   解决方案：
-//     1. 用已收盘K线算出稳定的 RSI 历史（avgGain/avgLoss 状态）
-//     2. 在此基础上，用当前实时价格做「增量一步」算出实时 RSI
-//     3. 穿越检测 = 上一根已收盘K线的 RSI vs 实时 RSI
-//     4. 防抖：记录上次触发信号的K线时间戳，同一根K线内不重复触发
-//
-// BUY:  上一根收盘 RSI ≤ 30，实时 RSI > 30 → 立即买入
-// SELL: 实时 RSI > 80 / 上一根收盘 RSI ≥ 70 且实时 RSI < 70 / TP+50% / SL-15%
+// 实现说明：
+//   - RSI 基线使用「已收盘K线」(Wilder smoothing)
+//   - 每次 1s 轮询，用实时价格对基线做一步增量，得到当前 RSI
+//   - 穿越判定使用「上一轮询 RSI -> 当前 RSI」
+//     避免“上一根收盘 vs 当前实时”导致的错位触发
 
 'use strict';
 
@@ -89,11 +85,6 @@ function stepRSI(avgGain, avgLoss, lastClose, newPrice, period = RSI_PERIOD) {
 /**
  * Evaluate RSI signals.
  *
- * Uses closed candles to compute stable RSI, then steps forward one tick
- * with the current real-time price to get instant RSI.
- *
- * Crossover detection = lastClosedRSI vs realtimeRSI.
- *
  * @param {Array}  closedCandles — 已收盘K线 (oldest first)
  * @param {number} realtimePrice — 当前实时价格
  * @param {Object} tokenState    — mutable token state
@@ -108,36 +99,35 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     return { rsi: NaN, signal: null, reason: `warming_up(${len}/${RSI_PERIOD + 1} closed)` };
   }
 
-  const { rsiArray, avgGain, avgLoss } = calcRSIWithState(closes, RSI_PERIOD);
-
-  const rsiLastClosed = rsiArray[len - 1];   // 最后一根已收盘K线的 RSI
-
-  if (isNaN(rsiLastClosed)) {
-    return { rsi: NaN, signal: null, reason: 'rsi_nan' };
-  }
-
-  // 用实时价格在已收盘基础上增量一步，得到实时 RSI
-  const lastClose  = closes[len - 1];
+  const { avgGain, avgLoss } = calcRSIWithState(closes, RSI_PERIOD);
+  const lastClose = closes[len - 1];
   const rsiRealtime = stepRSI(avgGain, avgLoss, lastClose, realtimePrice, RSI_PERIOD);
 
-  // ── 防抖：同一根K线时间窗口内不重复触发同类信号 ──────────
-  const now = Date.now();
-  const currentBucket = Math.floor(now / (KLINE_INTERVAL * 1000));
-  const lastBuyBucket  = tokenState._lastBuyBucket  || 0;
-  const lastSellBucket = tokenState._lastSellBucket || 0;
+  // 以前一秒 RSI 作为“前值”，确保真穿越（而不是收盘/实时错位）
+  const prevRsi = Number.isFinite(tokenState._prevRsiRealtime)
+    ? tokenState._prevRsiRealtime
+    : null;
+  tokenState._prevRsiRealtime = rsiRealtime;
+
+  // 首个可用 RSI 点，仅缓存，不触发信号
+  if (prevRsi === null) {
+    return { rsi: rsiRealtime, signal: null, reason: 'prime_prev_rsi' };
+  }
 
   // ── SELL conditions (check first if in position) ─────────────
   if (tokenState.inPosition) {
     // 1. 实时 RSI > 80 → 立即卖出
-    if (rsiRealtime > RSI_PANIC_LEVEL && currentBucket !== lastSellBucket) {
-      tokenState._lastSellBucket = currentBucket;
+    if (rsiRealtime > RSI_PANIC_LEVEL) {
       return { rsi: rsiRealtime, signal: 'SELL', reason: `RSI_PANIC(${rsiRealtime.toFixed(1)}>${RSI_PANIC_LEVEL})` };
     }
 
-    // 2. RSI 下穿 70（上一根收盘 ≥ 70，实时 < 70）
-    if (rsiLastClosed >= RSI_SELL_LEVEL && rsiRealtime < RSI_SELL_LEVEL && currentBucket !== lastSellBucket) {
-      tokenState._lastSellBucket = currentBucket;
-      return { rsi: rsiRealtime, signal: 'SELL', reason: `RSI_CROSS_DOWN_70(${rsiLastClosed.toFixed(1)}→${rsiRealtime.toFixed(1)})` };
+    // 2. RSI 下穿 70（前值 ≥ 70，当前 < 70）
+    if (prevRsi >= RSI_SELL_LEVEL && rsiRealtime < RSI_SELL_LEVEL) {
+      return {
+        rsi: rsiRealtime,
+        signal: 'SELL',
+        reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`,
+      };
     }
 
     // 3. 止盈 +50%（实时价格）
@@ -147,19 +137,18 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
       if (pnl >= 50) {
         return { rsi: rsiRealtime, signal: 'SELL', reason: `TAKE_PROFIT(+${pnl.toFixed(1)}%≥50%)` };
       }
-      // 4. 止损 -15%（实时价格）
-      if (pnl <= -15) {
-        return { rsi: rsiRealtime, signal: 'SELL', reason: `STOP_LOSS(${pnl.toFixed(1)}%≤-15%)` };
-      }
     }
   }
 
   // ── BUY condition (only if NOT in position) ──────────────────
   if (!tokenState.inPosition) {
-    // RSI 上穿 30：上一根收盘 RSI ≤ 30，实时 RSI > 30 → 立即买入
-    if (rsiLastClosed <= RSI_BUY_LEVEL && rsiRealtime > RSI_BUY_LEVEL && currentBucket !== lastBuyBucket) {
-      tokenState._lastBuyBucket = currentBucket;
-      return { rsi: rsiRealtime, signal: 'BUY', reason: `RSI_CROSS_UP_30(closed=${rsiLastClosed.toFixed(1)}→rt=${rsiRealtime.toFixed(1)})` };
+    // RSI 上穿 30：前值 ≤ 30，当前 > 30
+    if (prevRsi <= RSI_BUY_LEVEL && rsiRealtime > RSI_BUY_LEVEL) {
+      return {
+        rsi: rsiRealtime,
+        signal: 'BUY',
+        reason: `RSI_CROSS_UP_30(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`,
+      };
     }
   }
 
@@ -222,9 +211,8 @@ function buildCandles(ticks, intervalSec = KLINE_INTERVAL) {
     if (now >= candleEndTime) {
       candles.push(current);
       return { closed: candles, current: null };
-    } else {
-      return { closed: candles, current };
     }
+    return { closed: candles, current };
   }
 
   return { closed: candles, current: null };
