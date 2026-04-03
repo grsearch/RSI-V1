@@ -4,12 +4,11 @@
 //   webhook 收到代币 → 开始 15 分钟监控期
 //   → 1秒轮询价格，聚合 5 秒 K 线，计算 RSI(7)
 //   → RSI 上穿 30 买入
-//   → RSI 下穿 70 / RSI > 80 / +50% 止盈 / -15% 止损 卖出
+//   → RSI 下穿 70 / RSI > 80 / +50% 止盈 卖出
 //
 // 仓位管理：
-//   - 第一笔交易盈利 → 不再开仓，退出监控
-//   - 第一笔交易亏损 → 允许再开一次（第二笔无论盈亏，退出）
-//   - 最多 2 次开仓
+//   - 仅允许 1 次开仓
+//   - 第一笔平仓后（无论盈亏）退出监控
 //   - 15 分钟到期自动清仓退出
 //   - FDV < $10,000 立即退出
 
@@ -289,19 +288,9 @@ class TokenMonitor {
     this._addTradeLog({ type: 'SELL', symbol: state.symbol, reason });
     this._finalizeTradeRecord(state, reason);
 
-    // ── 仓位管理规则 ──────────────────────────────────────
-    if (state.tradeCount === 1) {
-      if (isProfit) {
-        // 第一笔盈利 → 不再开仓，退出
-        logger.info(`[Monitor] 🏁 ${state.symbol} 第1笔盈利(${pnlPct.toFixed(1)}%)，退出监控`);
-        state.shouldExit = true;
-      } else {
-        // 第一笔亏损 → 允许再开一次
-        logger.info(`[Monitor] ↩️ ${state.symbol} 第1笔亏损(${pnlPct.toFixed(1)}%)，允许再开一次`);
-      }
-    } else if (state.tradeCount >= 2) {
-      // 第二笔无论盈亏 → 退出
-      logger.info(`[Monitor] 🏁 ${state.symbol} 第2笔完成(${pnlPct.toFixed(1)}%)，退出监控`);
+    // ── 仓位管理规则：只开一笔，平仓即退出 ───────────────────
+    if (state.tradeCount >= 1) {
+      logger.info(`[Monitor] 🏁 ${state.symbol} 第1笔完成(${pnlPct.toFixed(1)}%)，退出监控`);
       state.shouldExit = true;
     }
 
