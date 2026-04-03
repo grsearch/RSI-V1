@@ -111,15 +111,11 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   const currentBucket = Math.floor(nowMs / (KLINE_INTERVAL * 1000));
   const lastBuyBucket = tokenState._lastBuyBucket ?? -1;
   const lastSellBucket = tokenState._lastSellBucket ?? -1;
-  const prevRsi = tokenState._prevRsiRealtime;
+  const prevRsiRaw = tokenState._prevRsiRealtime;
   const prevTs = tokenState._prevRsiTs ?? 0;
-
-  // 如果上一笔 RSI 不是“连续轮询”产生（例如断档太久），先重建基线，避免 0.0→90+ 误判
-  if (!Number.isFinite(prevRsi) || (nowMs - prevTs) > 2500) {
-    tokenState._prevRsiRealtime = rsiRealtime;
-    tokenState._prevRsiTs = nowMs;
-    return { rsi: rsiRealtime, prevRsi: lastClosedRsi, signal: null, reason: 'rsi_rebase' };
-  }
+  const isStale = !Number.isFinite(prevRsiRaw) || (nowMs - prevTs) > 2500;
+  // 断档时回退到“上一根已收盘 RSI”作为前值，不直接跳过这次信号判定
+  const prevRsi = isStale ? lastClosedRsi : prevRsiRaw;
 
   // ── SELL conditions (check first if in position) ─────────────
   if (tokenState.inPosition) {
@@ -174,7 +170,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
 
   tokenState._prevRsiRealtime = rsiRealtime;
   tokenState._prevRsiTs = nowMs;
-  return { rsi: rsiRealtime, prevRsi, signal: null, reason: '' };
+  return { rsi: rsiRealtime, prevRsi, signal: null, reason: isStale ? 'rsi_rebase' : '' };
 }
 
 /**
